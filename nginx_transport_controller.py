@@ -32,7 +32,6 @@ import nginx_transport_controller.utils.kube_config as KubeConfig
 logging.basicConfig(
     format='[%(asctime)s] NGINX_TRANSPORT_CONTROLLER [%(levelname)-8.8s] %(message)s',
     filename='/dev/stdout',
-    encoding='utf-8',
     level=logging.INFO
 )
 
@@ -134,7 +133,7 @@ if __name__ == '__main__':
     # Connect to Kubernetes cluster API using generated kubeconfig file
     try:
         logging.info("Loading kubeconfig...")
-        config.load_kube_config("../kubeconfig.yaml")
+        config.load_kube_config()
     except TypeError:
         logging.error("Failed to load kubeconfig")
         exit(1)
