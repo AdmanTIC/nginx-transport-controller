@@ -126,11 +126,10 @@ if __name__ == '__main__':
     UDP_CONFIGMAP = args.udp_services_configmap
 
     # Generate kubeconfig file
-    # TODO UNCOMMENT
-    # logging.info("Generate kubeconfig file")
-    # kubeconfig_file = KubeConfig.KubeConfFile()
-    # kubeconfig_file.set_sa_data()
-    # kubeconfig_file.generate_file()
+    logging.info("Generate kubeconfig file")
+    kubeconfig_file = KubeConfig.KubeConfFile()
+    kubeconfig_file.set_sa_data()
+    kubeconfig_file.generate_file()
 
     # Connect to Kubernetes cluster API using generated kubeconfig file
     try:
