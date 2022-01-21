@@ -9,6 +9,10 @@ from kubernetes.client.rest import ApiException
 from nginx_transport_controller.utils.ExposedService import ExposedService
 import nginx_transport_controller.utils.kube_config as KubeConfig
 
+from nginx_transport_controller.configuration import (
+    SERVICEEXPOSER_CRD
+)
+
 """ nginx transport controller
     Python script used to configure NGINX Ingress Controller by watching 
     Kubernetes events :
@@ -36,12 +40,25 @@ logging.basicConfig(
 )
 
 
-def get_service_exposers():
+def update_service_exposer_status(name, ns, status):
+    global custom_object_api
+
+    patch_data = custom_object_api.get_namespaced_custom_object(group=SERVICEEXPOSER_CRD['group'], version=SERVICEEXPOSER_CRD['version'], plural=SERVICEEXPOSER_CRD['plural'], namespace=ns, name=name)
+    patch_data['status'] = {}
+    patch_data['status']['configStatus'] = status
+    custom_object_api.patch_namespaced_custom_object(group=SERVICEEXPOSER_CRD['group'], version=SERVICEEXPOSER_CRD['version'], plural=SERVICEEXPOSER_CRD['plural'], namespace=ns, name=name, body=patch_data)
+
+
+def process_service_exposers():
     global custom_object_api, service_exposers_lastrev
-    service_exposers_lastrev = {}
-    service_exposers_list = custom_object_api.list_cluster_custom_object(group="admantic.fr", version="v1", plural="serviceexposers")
+    service_exposers_list = custom_object_api.list_cluster_custom_object(group=SERVICEEXPOSER_CRD['group'], version=SERVICEEXPOSER_CRD['version'], plural=SERVICEEXPOSER_CRD['plural'])
     
     for service_exposer in service_exposers_list['items']:
+        
+        if "%s_%s" % (service_exposer['metadata']['namespace'], service_exposer['metadata']['name']) in service_exposers_lastrev:
+            for port, exposed_service in service_exposers_lastrev["%s_%s" % (service_exposer['metadata']['namespace'], service_exposer['metadata']['name'])].items():
+                delete_port_entry(exposed_service)
+        service_exposers_lastrev["%s_%s" % (service_exposer['metadata']['namespace'], service_exposer['metadata']['name'])] = {}
         for exposed_service in service_exposer['spec']['exposedServices']:
             current_exposed_service = ExposedService(
                 name=exposed_service['targetServiceName'],
@@ -51,64 +68,90 @@ def get_service_exposers():
                 protocol=exposed_service['protocol'],
                 resource_version=service_exposer['metadata']['namespace']
             )
-            service_exposers_lastrev[exposed_service['externalPort']] = current_exposed_service
-    
-    configure_nginx_transport_controller()
+
+            add_port_entry(current_exposed_service)
+            service_exposers_lastrev["%s_%s" % (service_exposer['metadata']['namespace'], service_exposer['metadata']['name'])][exposed_service['externalPort']] = current_exposed_service
+
+        # Added
+        update_service_exposer_status(service_exposer['metadata']['name'], service_exposer['metadata']['namespace'], "Added")
 
 
-def configure_nginx_transport_controller():
+def delete_port_entry(deleted_service):
     global v1, NGINX_NAMESPACE, TCP_CONFIGMAP, UDP_CONFIGMAP, service_exposers_lastrev
 
-    new_tcp_configmap_data = {}
-    new_udp_configmap_data = {}
+    if deleted_service.get_protocol() == "tcp":
+        CONFIGMAP = TCP_CONFIGMAP
+    elif deleted_service.get_protocol() == "udp":
+        CONFIGMAP = UDP_CONFIGMAP
 
-    for key, exposed_service in service_exposers_lastrev.items():
-        if exposed_service.get_protocol() == "tcp":
-            new_tcp_configmap_data[key] = exposed_service.format()
-        elif exposed_service.get_protocol() == "udp":
-            new_udp_configmap_data[key] = exposed_service.format()
-
-    # Patch TCP ConfigMap
     try:
-        if len(new_tcp_configmap_data) != 0:
-            new_tcp_configmap = client.V1ConfigMap()
-            new_tcp_configmap.metadata = client.V1ObjectMeta(name=TCP_CONFIGMAP, namespace=NGINX_NAMESPACE)
-            new_tcp_configmap.data = new_tcp_configmap_data
-            v1.delete_namespaced_config_map(name=TCP_CONFIGMAP, namespace=NGINX_NAMESPACE)
-            v1.create_namespaced_config_map(namespace=NGINX_NAMESPACE, body=new_tcp_configmap)
+        current_configmap = v1.read_namespaced_config_map(name=CONFIGMAP, namespace=NGINX_NAMESPACE)
+        if current_configmap.data != None and str(deleted_service.get_external_port()) in current_configmap.data:
+            del current_configmap.data[str(deleted_service.get_external_port())]    
+
+        new_configmap = client.V1ConfigMap()
+        new_configmap.metadata = client.V1ObjectMeta(name=CONFIGMAP, namespace=NGINX_NAMESPACE)
+        new_configmap.data = current_configmap.data
+
+        v1.delete_namespaced_config_map(name=CONFIGMAP, namespace=NGINX_NAMESPACE)
+        v1.create_namespaced_config_map(namespace=NGINX_NAMESPACE, body=new_configmap)
     except ApiException as e:
-        logging.error("Failed to patch ConfigMap %s/%s: %s" % (NGINX_NAMESPACE, TCP_CONFIGMAP, e))
+        logging.error("Failed to patch ConfigMap %s/%s: %s" % (NGINX_NAMESPACE, CONFIGMAP, e))
         exit(1)
 
-    # Patch UDP ConfigMap
+
+def add_port_entry(added_service):
+    global v1, NGINX_NAMESPACE, TCP_CONFIGMAP, UDP_CONFIGMAP, service_exposers_lastrev
+
+    if added_service.get_protocol() == "tcp":
+        CONFIGMAP = TCP_CONFIGMAP
+    elif added_service.get_protocol() == "udp":
+        CONFIGMAP = UDP_CONFIGMAP
+
+    data_patch = {}
     try:
-        if len(new_udp_configmap_data) != 0:
-            new_udp_configmap = client.V1ConfigMap()
-            new_udp_configmap.metadata = client.V1ObjectMeta(name=UDP_CONFIGMAP, namespace=NGINX_NAMESPACE)
-            new_udp_configmap.data = new_udp_configmap_data
-            v1.delete_namespaced_config_map(name=UDP_CONFIGMAP, namespace=NGINX_NAMESPACE)
-            v1.create_namespaced_config_map(namespace=NGINX_NAMESPACE, body=new_udp_configmap)
+        data_patch[added_service.get_external_port()] = added_service.format()
+        patch = client.V1ConfigMap()
+        patch.metadata = client.V1ObjectMeta(name=CONFIGMAP, namespace=NGINX_NAMESPACE)
+        patch.data = data_patch
+        v1.patch_namespaced_config_map(name=CONFIGMAP, namespace=NGINX_NAMESPACE, body=patch)
     except ApiException as e:
-        logging.error("Failed to patch ConfigMap %s/%s: %s" % (NGINX_NAMESPACE, UDP_CONFIGMAP, e))
+        logging.error("Failed to patch ConfigMap %s/%s: %s" % (NGINX_NAMESPACE, CONFIGMAP, e))
         exit(1)
 
 
 def main():
     global custom_object_api, service_exposers_lastrev
 
+    service_exposers_lastrev = {}
+    service_exposers_list = custom_object_api.list_cluster_custom_object(group=SERVICEEXPOSER_CRD['group'], version=SERVICEEXPOSER_CRD['version'], plural=SERVICEEXPOSER_CRD['plural'])
+
+    # Pre-processing
     logging.info("Get initial ServiceExposers...")
-    get_service_exposers()
+    
+    # Set initial ServiceExposer as `Pending` status
+    for service_exposer in service_exposers_list['items']:
+        # Pending
+        update_service_exposer_status(service_exposer['metadata']['name'], service_exposer['metadata']['namespace'], "Pending")
+
+    process_service_exposers()
+
 
     logging.info("Entering watch loop...")
     event_watcher = watch.Watch()
     while True:
         for event in event_watcher.stream(custom_object_api.list_cluster_custom_object, group="admantic.fr", version="v1", plural="serviceexposers", watch=True, timeout_seconds=900):
-            if event['type'] == 'ADDED':
+            if event['type'] == 'ADDED' or event['type'] == 'MODIFIED':
                 for exposed_service in event['object']['spec']['exposedServices']:
                     current_ext_port = exposed_service['externalPort']
-                    if current_ext_port not in service_exposers_lastrev or service_exposers_lastrev[current_ext_port].get_resource_version() != event['object']['metadata']['resourceVersion']:
-                        get_service_exposers()
-                        logging.info("Processing event for %s" % service_exposers_lastrev[current_ext_port].display())
+                    process_service_exposers()
+                    logging.info("Processing event [%s] for %s" % (event['type'], service_exposers_lastrev["%s_%s" % (event['object']['metadata']['namespace'], event['object']['metadata']['name'])][current_ext_port].display()))
+            elif event['type'] == 'DELETED':
+                for exposed_service in event['object']['spec']['exposedServices']:
+                    current_ext_port = exposed_service['externalPort']
+                    logging.info("Processing event [%s] for %s" % (event['type'], service_exposers_lastrev["%s_%s" % (event['object']['metadata']['namespace'], event['object']['metadata']['name'])][current_ext_port].display()))                    
+                    delete_port_entry(service_exposers_lastrev["%s_%s" % (event['object']['metadata']['namespace'], event['object']['metadata']['name'])][current_ext_port])
+                    process_service_exposers()
 
 
 if __name__ == '__main__':
