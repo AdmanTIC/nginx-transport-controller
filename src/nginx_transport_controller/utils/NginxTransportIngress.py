@@ -1,7 +1,7 @@
-""" ExposedService class
+""" NginxTransportIngress class
     Represents service to be exposed by NGINX Ingress Controller.
     The services data is fed by retrieving informations in 
-    ServiceExposer custom resources.
+    NginxTransportIngress custom resources.
 
     Parameters :
     - name: Service name
@@ -9,10 +9,10 @@
     - external_port: Port exposed by NGINX Ingress Controller
     - internal_port: Port on which trafic is forwarded to inside the cluster
     - protocol: Transport protocol (TCP or UDP)
-    - resource_version: ServiceExposer resource version
+    - resource_version: NginxTransportIngress resource version
 """
 
-class ExposedService:
+class NginxTransportIngress:
     def __init__(self, name, ns, external_port, internal_port, protocol, resource_version):
         self.name = name
         self.ns = ns

@@ -7,10 +7,10 @@
 import logging
 import os
 
-SERVICEEXPOSER_CRD = {
+NGINXTRANSPORTINGRESS_CRD = {
     "group": "admantic.fr",
     "version": "v1",
-    "plural": "serviceexposers",
+    "plural": "nginxtransportingresses",
 }
 
 # Set env. vars.
