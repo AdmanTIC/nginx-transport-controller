@@ -25,6 +25,7 @@ from nginx_transport_controller.configuration import (
             * Edit its ConfigMap according to ServiceExposer data
 
     Parameters :
+    -s, --service' : NGINX Ingress Controller service name
     -t, --tcp-services-configmap : NGINX Ingress Controller ConfigMap name for TCP services (--tcp-services-configmap NGINX Ingress Controller parameters)
     -u, --udp-services-configmap : NGINX Ingress Controller ConfigMap name for UDP services (--udp-services-configmap NGINX Ingress Controller parameters)
 
@@ -52,7 +53,8 @@ logging.basicConfig(
 
 """ process_nginx_transport_ingresses()
     Put all exposed services into a list by retrieving all NginxTransportIngresses 
-    and call add_port_entries() to patch (replace) corresponding ConfigMaps.
+    and call add_port_entries() to patch (replace) corresponding ConfigMaps 
+    and to patch NGINX Ingress Controller Service.
 """
 def process_nginx_transport_ingresses():
     global custom_object_api, nginx_transport_ingresses_lastrev
@@ -79,19 +81,35 @@ def process_nginx_transport_ingresses():
     (`nginx_transport_ingresses_lastrev`)
 """
 def add_port_entries():
-    global v1, NGINX_NAMESPACE, TCP_CONFIGMAP, UDP_CONFIGMAP, nginx_transport_ingresses_lastrev
+    global v1, NGINX_NAMESPACE, TCP_CONFIGMAP, UDP_CONFIGMAP, NGINX_SERVICE, nginx_transport_ingresses_lastrev
 
     tcp_data_patch = {}
     udp_data_patch = {}
 
-    # Format data to be patched
+    service_data_patch = [
+        {
+            'name': 'http',
+            'port': 80,
+            'targetPort': 80,
+            'protocol': 'TCP'
+        },
+        {
+            'name': 'https',
+            'port': 443,
+            'targetPort': 443,
+            'protocol': 'TCP'
+        }
+    ]
+
+    # Format ConfigMap and Service data to be patched
     for nginx_transport_ingress, exposed_services in nginx_transport_ingresses_lastrev.items():
         for external_port, exposed_service in exposed_services.items():
+            service_data_patch.append(exposed_service.format_service())
             if exposed_service.get_protocol() == "tcp":
-                tcp_data_patch[external_port] = exposed_service.format()
+                tcp_data_patch[external_port] = exposed_service.format_configmap()
             elif exposed_service.get_protocol() == "udp":
-                udp_data_patch[external_port] = exposed_service.format()
-            
+                udp_data_patch[external_port] = exposed_service.format_configmap()
+
     # Patch current TCP and UDP ConfigMaps
     try:
         # TCP
@@ -111,6 +129,16 @@ def add_port_entries():
         logging.error("Failed to patch ConfigMap %s/%s: %s" % (NGINX_NAMESPACE, CONFIGMAP, e.reason))
         return -1
 
+    # Patch current NGINX Ingress Controller Service
+    try:
+        service_patch = v1.read_namespaced_service(name=NGINX_SERVICE, namespace=NGINX_NAMESPACE)
+        service_patch.spec.ports = service_data_patch
+        v1.replace_namespaced_service(name=NGINX_SERVICE, namespace=NGINX_NAMESPACE, body=service_patch)
+    except ApiException as e:
+        logging.error("Failed to patch Service %s/%s: %s" % (NGINX_NAMESPACE, NGINX_SERVICE, e))
+        return -1
+
+    return 0
 
 def main():
     global custom_object_api, nginx_transport_ingresses_lastrev
@@ -145,12 +173,14 @@ if __name__ == '__main__':
 
     # Parse arguments
     parser = argparse.ArgumentParser(description='Move specified IP to current node service')
+    parser.add_argument('-s', '--service', help='<Required> NGINX Ingress Controller service name', required=True)
     parser.add_argument('-t', '--tcp-services-configmap', help='<Required> NGINX Ingress Controller ConfigMap name for TCP services (--tcp-services-configmap NGINX Ingress Controller parameters)', required=True)
     parser.add_argument('-u', '--udp-services-configmap', help='<Required> NGINX Ingress Controller ConfigMap name for UDP services (--udp-services-configmap NGINX Ingress Controller parameters)', required=True)
     args = parser.parse_args()
 
     with open(os.path.join("/var/run/secrets/kubernetes.io/serviceaccount", "namespace")) as infile:
         NGINX_NAMESPACE = infile.read().rstrip("\n")
+    NGINX_SERVICE = args.service
     TCP_CONFIGMAP = args.tcp_services_configmap
     UDP_CONFIGMAP = args.udp_services_configmap
 
@@ -163,7 +193,7 @@ if __name__ == '__main__':
     # Connect to Kubernetes cluster API using generated kubeconfig file
     try:
         logging.info("Loading kubeconfig...")
-        config.load_kube_config("")
+        config.load_kube_config()
     except ApiException as e:
         logging.error("Failed to load kubeconfig: %s" % (e.reason))
         exit(-1)

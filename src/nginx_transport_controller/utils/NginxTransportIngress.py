@@ -53,5 +53,13 @@ class NginxTransportIngress:
         Format data to fit in ConfigMap 
         (cf. https://kubernetes.github.io/ingress-nginx/user-guide/exposing-tcp-udp-services/)
     """
-    def format(self):
+    def format_configmap(self):
         return "%s/%s:%s" % (self.ns, self.name, self.internal_port)
+
+    def format_service(self):
+        return {
+            'name' : "nginx-%s-%s" % (self.external_port, self.internal_port),
+            'port': self.external_port,
+            'target_port': self.internal_port,
+            'protocol': self.protocol
+        }
