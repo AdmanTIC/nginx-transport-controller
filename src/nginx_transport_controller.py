@@ -3,6 +3,8 @@
 
 import argparse
 import logging
+import time
+import os
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 
@@ -13,6 +15,7 @@ from nginx_transport_controller.configuration import (
     NGINXTRANSPORTINGRESS_CRD
 )
 
+
 """ nginx transport controller
     Python script used to configure NGINX Ingress Controller by watching 
     Kubernetes events :
@@ -22,7 +25,6 @@ from nginx_transport_controller.configuration import (
             * Edit its ConfigMap according to ServiceExposer data
 
     Parameters :
-    -n, --nginx-ns : NGINX Ingress Controller namespace
     -t, --tcp-services-configmap : NGINX Ingress Controller ConfigMap name for TCP services (--tcp-services-configmap NGINX Ingress Controller parameters)
     -u, --udp-services-configmap : NGINX Ingress Controller ConfigMap name for UDP services (--udp-services-configmap NGINX Ingress Controller parameters)
 
@@ -32,7 +34,6 @@ from nginx_transport_controller.configuration import (
     0 : OK
     !=0 : NOK
 """
-
 logging.basicConfig(
     format='[%(asctime)s] NGINX_TRANSPORT_CONTROLLER [%(levelname)-8.8s] %(message)s',
     filename='/dev/stdout',
@@ -70,7 +71,7 @@ def process_nginx_transport_ingresses():
             )
             nginx_transport_ingresses_lastrev["%s_%s" % (nginx_transport_ingress['metadata']['namespace'], nginx_transport_ingress['metadata']['name'])][exposed_service['externalPort']] = current_exposed_service
 
-    add_port_entries() 
+    return add_port_entries()
 
 
 """ add_port_entries()
@@ -107,8 +108,8 @@ def add_port_entries():
         configmap_patch.data = udp_data_patch
         v1.replace_namespaced_config_map(name=CONFIGMAP, namespace=NGINX_NAMESPACE, body=configmap_patch)
     except ApiException as e:
-        logging.error("Failed to patch ConfigMap %s/%s: %s" % (NGINX_NAMESPACE, CONFIGMAP, e))
-        exit(1)
+        logging.error("Failed to patch ConfigMap %s/%s: %s" % (NGINX_NAMESPACE, CONFIGMAP, e.reason))
+        return -1
 
 
 def main():
@@ -117,31 +118,39 @@ def main():
     nginx_transport_ingresses_lastrev = {}
 
     # Pre-processing
-    logging.info("Get initial NginxTransportIngresses...")
-    process_nginx_transport_ingresses()
+    # logging.info("Get initial NginxTransportIngresses...")
+    # process_nginx_transport_ingresses()
 
     # Watch loop
     logging.info("Entering watch loop...")
     event_watcher = watch.Watch()
     while True:
+        logging.info("Reading events...")
+        retry_count = 0
         for event in event_watcher.stream(custom_object_api.list_cluster_custom_object, group=NGINXTRANSPORTINGRESS_CRD['group'], version=NGINXTRANSPORTINGRESS_CRD['version'], plural=NGINXTRANSPORTINGRESS_CRD['plural'], watch=True, timeout_seconds=900):
-            if event['type'] == 'ADDED' or event['type'] == 'MODIFIED' or event['type'] == 'DELETED':
-                for exposed_service in event['object']['spec']['exposedServices']:
-                    current_ext_port = exposed_service['externalPort']
-                    logging.info("Processing event [%s] for %s" % (event['type'], nginx_transport_ingresses_lastrev["%s_%s" % (event['object']['metadata']['namespace'], event['object']['metadata']['name'])][current_ext_port].display()))
-                process_nginx_transport_ingresses()
+            logging.info("Processing event [%s] for %s/%s" % (event['type'], event['object']['metadata']['namespace'], event['object']['metadata']['name']))
+            
+            while process_nginx_transport_ingresses() == -1 and retry_count < 10:
+                retry_count += 1
+                logging.info("Failed to process event %s/%s - Retrying..." % (event['object']['metadata']['namespace'], event['object']['metadata']['name']))
+                time.sleep(10)
+
+            if retry_count >= 10:
+                break
+
+        time.sleep(1)
 
 
 if __name__ == '__main__':
 
     # Parse arguments
     parser = argparse.ArgumentParser(description='Move specified IP to current node service')
-    parser.add_argument('-n', '--nginx-ns', help='<Required> NGINX Ingress Controller namespace', required=True)
     parser.add_argument('-t', '--tcp-services-configmap', help='<Required> NGINX Ingress Controller ConfigMap name for TCP services (--tcp-services-configmap NGINX Ingress Controller parameters)', required=True)
     parser.add_argument('-u', '--udp-services-configmap', help='<Required> NGINX Ingress Controller ConfigMap name for UDP services (--udp-services-configmap NGINX Ingress Controller parameters)', required=True)
     args = parser.parse_args()
 
-    NGINX_NAMESPACE = args.nginx_ns
+    with open(os.path.join("/var/run/secrets/kubernetes.io/serviceaccount", "namespace")) as infile:
+        NGINX_NAMESPACE = infile.read().rstrip("\n")
     TCP_CONFIGMAP = args.tcp_services_configmap
     UDP_CONFIGMAP = args.udp_services_configmap
 
@@ -154,13 +163,20 @@ if __name__ == '__main__':
     # Connect to Kubernetes cluster API using generated kubeconfig file
     try:
         logging.info("Loading kubeconfig...")
-        config.load_kube_config()
-    except TypeError:
-        logging.error("Failed to load kubeconfig")
-        exit(1)
+        config.load_kube_config("")
+    except ApiException as e:
+        logging.error("Failed to load kubeconfig: %s" % (e.reason))
+        exit(-1)
 
     v1 = client.CoreV1Api()
     v1beta1 = client.ExtensionsV1beta1Api()
     custom_object_api = client.CustomObjectsApi()
+
+    for CONFIGMAP in (TCP_CONFIGMAP, UDP_CONFIGMAP):
+        try:
+            v1.read_namespaced_config_map(name=CONFIGMAP, namespace=NGINX_NAMESPACE)
+        except ApiException as e:
+            logging.error("Failed to read ConfigMap %s/%s: %s" % (NGINX_NAMESPACE, CONFIGMAP, e.reason))
+            exit(-1)
 
     main()
