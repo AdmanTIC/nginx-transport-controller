@@ -5,6 +5,8 @@ import argparse
 import logging
 import time
 import os
+import threading
+
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 
@@ -116,6 +118,7 @@ def add_port_entries():
         CONFIGMAP = TCP_CONFIGMAP
         configmap_patch = client.V1ConfigMap()
         configmap_patch.metadata = client.V1ObjectMeta(name=CONFIGMAP, namespace=NGINX_NAMESPACE)
+        configmap_patch.metadata.labels = {"app.kubernetes.io/managed-by": "nginx-transport-controller"}
         configmap_patch.data = tcp_data_patch
         v1.replace_namespaced_config_map(name=CONFIGMAP, namespace=NGINX_NAMESPACE, body=configmap_patch)
         
@@ -123,6 +126,7 @@ def add_port_entries():
         CONFIGMAP = UDP_CONFIGMAP
         configmap_patch = client.V1ConfigMap()
         configmap_patch.metadata = client.V1ObjectMeta(name=CONFIGMAP, namespace=NGINX_NAMESPACE)
+        configmap_patch.metadata.labels = {"app.kubernetes.io/managed-by": "nginx-transport-controller"}
         configmap_patch.data = udp_data_patch
         v1.replace_namespaced_config_map(name=CONFIGMAP, namespace=NGINX_NAMESPACE, body=configmap_patch)
     except ApiException as e:
@@ -135,38 +139,56 @@ def add_port_entries():
         service_patch.spec.ports = service_data_patch
         v1.replace_namespaced_service(name=NGINX_SERVICE, namespace=NGINX_NAMESPACE, body=service_patch)
     except ApiException as e:
-        logging.error("Failed to patch Service %s/%s: %s" % (NGINX_NAMESPACE, NGINX_SERVICE, e))
+        logging.error("Failed to patch Service %s/%s: %s" % (NGINX_NAMESPACE, NGINX_SERVICE, e.reason))
         return -1
 
     return 0
+
+
+def watch_nginx_transport_ingresses():
+    global custom_object_api
+    event_watcher1 = watch.Watch()
+
+    logging.info("Reading NginxTransportIngress events...")
+    for event in event_watcher1.stream(custom_object_api.list_cluster_custom_object, group=NGINXTRANSPORTINGRESS_CRD['group'], version=NGINXTRANSPORTINGRESS_CRD['version'], plural=NGINXTRANSPORTINGRESS_CRD['plural'], watch=True, timeout_seconds=900):
+        logging.info("Processing event [%s] for %s/%s" % (event['type'], event['object']['metadata']['namespace'], event['object']['metadata']['name']))
+        process_nginx_transport_ingresses()
+
+
+def watch_configmaps():
+    global v1, NGINX_NAMESPACE, TCP_CONFIGMAP, UDP_CONFIGMAP
+    event_watcher = watch.Watch()
+
+    logging.info("Reading ConfigMap events...")
+    for event in event_watcher.stream(v1.list_namespaced_config_map, namespace=NGINX_NAMESPACE, watch=True, timeout_seconds=900):
+        if event['object'].metadata.name in (TCP_CONFIGMAP, UDP_CONFIGMAP):
+            if event['object'].metadata.labels != None and "app.kubernetes.io/managed-by" in event['object'].metadata.labels:
+                    if event['object'].metadata.labels['app.kubernetes.io/managed-by'] == 'Helm':
+                        logging.info("ConfigMap %s/%s has been reset, recomputing..." % (event['object'].metadata.namespace, event['object'].metadata.name))
+                        process_nginx_transport_ingresses()
+
 
 def main():
     global custom_object_api, nginx_transport_ingresses_lastrev
 
     nginx_transport_ingresses_lastrev = {}
 
+    threads = {
+        'watch_configmaps': watch_configmaps,
+        'watch_nginx_transport_ingresses': watch_nginx_transport_ingresses
+    }
+
     # Pre-processing
-    # logging.info("Get initial NginxTransportIngresses...")
-    # process_nginx_transport_ingresses()
+    logging.info("Get initial NginxTransportIngresses...")
+    threading.Thread(target=watch_configmaps, name="watch_configmaps").start()
+    threading.Thread(target=watch_nginx_transport_ingresses, name="watch_nginx_transport_ingresses").start()
 
     # Watch loop
-    logging.info("Entering watch loop...")
-    event_watcher = watch.Watch()
-    while True:
-        logging.info("Reading events...")
-        retry_count = 0
-        for event in event_watcher.stream(custom_object_api.list_cluster_custom_object, group=NGINXTRANSPORTINGRESS_CRD['group'], version=NGINXTRANSPORTINGRESS_CRD['version'], plural=NGINXTRANSPORTINGRESS_CRD['plural'], watch=True, timeout_seconds=900):
-            logging.info("Processing event [%s] for %s/%s" % (event['type'], event['object']['metadata']['namespace'], event['object']['metadata']['name']))
-            
-            while process_nginx_transport_ingresses() == -1 and retry_count < 10:
-                retry_count += 1
-                logging.info("Failed to process event %s/%s - Retrying..." % (event['object']['metadata']['namespace'], event['object']['metadata']['name']))
-                time.sleep(10)
-
-            if retry_count >= 10:
-                break
-
-        time.sleep(1)
+    while len(threading.enumerate()) > 1:
+        for thread_name in threads.keys():
+            if thread_name not in [thread.name for thread in threading.enumerate()]:
+                threading.Thread(target=threads[thread_name], name=thread_name).start()
+        time.sleep(10)
 
 
 if __name__ == '__main__':
