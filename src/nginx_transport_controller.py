@@ -137,7 +137,7 @@ def add_port_entries():
     try:
         service_patch = v1.read_namespaced_service(name=NGINX_SERVICE, namespace=NGINX_NAMESPACE)
         service_patch.spec.ports = service_data_patch
-        v1.replace_namespaced_service(name=NGINX_SERVICE, namespace=NGINX_NAMESPACE, body=service_patch)
+        v1.patch_namespaced_service(name=NGINX_SERVICE, namespace=NGINX_NAMESPACE, body=service_patch)
     except ApiException as e:
         logging.error("Failed to patch Service %s/%s: %s" % (NGINX_NAMESPACE, NGINX_SERVICE, e.reason))
         return -1
